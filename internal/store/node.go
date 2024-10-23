@@ -20,18 +20,17 @@ import (
 	"context"
 	"strings"
 
-	basemetrics "k8s.io/component-base/metrics"
-
-	"k8s.io/kube-state-metrics/v2/pkg/constant"
-	"k8s.io/kube-state-metrics/v2/pkg/metric"
-	generator "k8s.io/kube-state-metrics/v2/pkg/metric_generator"
-
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	basemetrics "k8s.io/component-base/metrics"
+
+	"k8s.io/kube-state-metrics/v2/pkg/constant"
+	"k8s.io/kube-state-metrics/v2/pkg/metric"
+	generator "k8s.io/kube-state-metrics/v2/pkg/metric_generator"
 )
 
 var (
@@ -40,6 +39,15 @@ var (
 	descNodeLabelsName          = "kube_node_labels"
 	descNodeLabelsHelp          = "Kubernetes labels converted to Prometheus labels."
 	descNodeLabelsDefaultLabels = []string{"node"}
+
+	// Standard Kubernetes node role label prefix
+	standardRolePrefix = "node-role.kubernetes.io/"
+	
+	// Alternative role labels used by different distributions
+	altRoleLabelKeys = []string{
+		"kubernetes.io/role",
+		"role",
+	}
 )
 
 func nodeMetricFamilies(allowAnnotationsList, allowLabelsList []string) []generator.FamilyGenerator {
@@ -91,14 +99,11 @@ func createNodeCreatedFamilyGenerator() generator.FamilyGenerator {
 		"",
 		wrapNodeFunc(func(n *v1.Node) *metric.Family {
 			ms := []*metric.Metric{}
-
 			if !n.CreationTimestamp.IsZero() {
 				ms = append(ms, &metric.Metric{
-
 					Value: float64(n.CreationTimestamp.Unix()),
 				})
 			}
-
 			return &metric.Family{
 				Metrics: ms,
 			}
@@ -158,7 +163,6 @@ func createNodeInfoFamilyGenerator() generator.FamilyGenerator {
 				n.Status.NodeInfo.SystemUUID,
 			}
 
-			// TODO: remove internal_ip in v3, replaced by kube_node_status_addresses
 			internalIP := ""
 			for _, address := range n.Status.Addresses {
 				if address.Type == "InternalIP" {
@@ -239,17 +243,35 @@ func createNodeRoleFamilyGenerator() generator.FamilyGenerator {
 		basemetrics.ALPHA,
 		"",
 		wrapNodeFunc(func(n *v1.Node) *metric.Family {
-			const prefix = "node-role.kubernetes.io/"
 			ms := []*metric.Metric{}
+			
+			// First check standard Kubernetes node role labels
+			hasStandardRole := false
 			for lbl := range n.Labels {
-				if strings.HasPrefix(lbl, prefix) {
+				if strings.HasPrefix(lbl, standardRolePrefix) {
+					hasStandardRole = true
 					ms = append(ms, &metric.Metric{
 						LabelKeys:   []string{"role"},
-						LabelValues: []string{strings.TrimPrefix(lbl, prefix)},
+						LabelValues: []string{strings.TrimPrefix(lbl, standardRolePrefix)},
 						Value:       float64(1),
 					})
 				}
 			}
+
+			// If no standard roles found, check alternative role labels
+			if !hasStandardRole {
+				for _, label := range altRoleLabelKeys {
+					if role, exists := n.Labels[label]; exists && role != "" {
+						ms = append(ms, &metric.Metric{
+							LabelKeys:   []string{"role"},
+							LabelValues: []string{role},
+							Value:       float64(1),
+						})
+						break // Use first matching role label
+					}
+				}
+			}
+
 			return &metric.Family{
 				Metrics: ms,
 			}
@@ -471,10 +493,6 @@ func createNodeStatusCapacityFamilyGenerator() generator.FamilyGenerator {
 	)
 }
 
-// createNodeStatusConditionFamilyGenerator returns an all-in-one metric family
-// containing all conditions for extensibility. Third party plugin may report
-// customized condition for cluster node (e.g. node-problem-detector), and
-// Kubernetes may add new core conditions in future.
 func createNodeStatusConditionFamilyGenerator() generator.FamilyGenerator {
 	return *generator.NewFamilyGeneratorWithStability(
 		"kube_node_status_condition",
